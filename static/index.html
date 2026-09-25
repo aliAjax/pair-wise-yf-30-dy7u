@@ -1,5 +1,110 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:white;padding:18px 20px;margin:14px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,textarea,select,button{font:inherit;padding:7px;margin:3px}
+input,select{width:auto}textarea{width:96%;min-height:56px}
+button{background:#174ea6;color:white;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#e3eaf5;color:#174ea6}
+button:disabled{background:#9db3d6;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:13px;margin-top:8px}
+td,th{border:1px solid #d9e0ec;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#eef3fb}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;color:white}
+.b-pending{background:#9aa4b2}.b-submitted{background:#1e7d46}.b-correction_pending{background:#b26a00}.b-overdue{background:#b3261e}
+.muted{color:#5f6b7c;font-size:13px}.err{background:#fdecea;color:#b3261e;padding:8px 12px;border-radius:8px;white-space:pre-wrap}
+.rowline{margin:6px 0}.ver-old{color:#7a8597}.ver-current{font-weight:700;color:#1e7d46}
+pre{background:#111827;color:#d1fae5;padding:12px;overflow:auto;font-size:12px;max-height:280px}
+.casebtn{text-align:left;width:100%;background:#f0f4fb;border:1px solid #cdd9ec;color:#172033;margin:2px 0}
+</style>
+<h1>药物警戒案例台</h1>
+<p class="muted">页面只负责操作与展示；版本规则、期限重算在服务端 <code>pv_rules.py</code>，旧稿/回执存档在 <code>pv_archive.py</code>。请求带 X-User-Id、X-Role，区域角色还需 X-Region。</p>
+<section>
+  <b>身份</b><br>
+  用户 <input id="user" value="lead-cn">
+  角色 <select id="role"><option>regional_lead</option><option>reporter</option><option>medical_reviewer</option><option>global_admin</option></select>
+  区域 <input id="region" value="CN" style="width:70px">
+  <button onclick="loadCases()">刷新案例</button>
+  <input id="caseId" placeholder="案例ID" style="width:80px"><button class="ghost" onclick="loadCase(Number(caseId.value))">直接打开案例</button>
+  <div id="banner"></div>
+</section>
+<section id="listSec" hidden><h2>案例列表</h2><div id="cases"></div></section>
+<section id="detailSec" hidden>
+  <h2>案例详情 <span id="caseTitle" class="muted"></span></h2>
+  <div id="caseMeta" class="muted"></div>
+  <h3>分国家报告（详情按版本顺序排列，加粗为当前有效版本）</h3>
+  <div id="reports"></div>
+  <details><summary>原始 JSON</summary><pre id="raw"></pre></details>
+</section>
+<script>
+const $=id=>document.getElementById(id);
+function headers(){return {'X-User-Id':$('user').value.trim(),'X-Role':$('role').value,'X-Region':$('region').value.trim().toUpperCase(),'Content-Type':'application/json'}}
+function banner(msg,isErr){$('banner').innerHTML=msg?`<div class="${isErr?'err':'muted'}">${msg}</div>`:''}
+async function api(method,path,body){
+  const opt={method,headers:headers()};if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(path,opt),data=await r.json();
+  if(!r.ok)throw Object.assign(new Error(data.message||'请求失败'),{code:data.error,status:r.status});
+  return data}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const STATE_TEXT={pending:'待提交',submitted:'当前有效',correction_pending:'有未提交更正',overdue:'已逾期'};
+async function loadCases(){
+  banner('');try{
+    const d=await api('GET','/api/cases');$('listSec').hidden=false;
+    $('cases').innerHTML=d.cases.map(c=>`<button class="casebtn" onclick="loadCase(${c.id})">#${c.id} ${esc(c.case_no)} | ${esc(c.region)} | ${esc(c.product)} | ${esc(c.event_term)} | 严重:${c.serious} 死亡:${c.fatal} | rev${c.revision}</button>`).join('')||'<span class="muted">无案例</span>';
+  }catch(e){banner(e.message,true)}}
+function reportCard(r){
+  const badge=`<span class="badge b-${r.version_state}">${STATE_TEXT[r.version_state]||r.version_state}</span>`;
+  const rows=r.versions.map(v=>{
+    const current=r.effective_version===v.version&&v.status==='submitted';
+    const prev=v.previous_content?`<div class="muted">基于 v${esc(r.versions.find(x=>x.id===v.previous_version_id)?.version)}：原提交人 ${esc(v.previous_submitted_by)} @ ${esc(v.previous_submitted_at)}
+      <details><summary>旧稿与旧回执</summary><pre>${esc(JSON.stringify({content:v.previous_content,receipt:v.previous_receipt},null,2))}</pre></details></div>`:'';
+    return `<tr class="${current?'ver-current':v.status==='superseded'||v.status==='void'?'ver-old':''}">
+      <td>v${v.version}</td><td>${v.status}</td><td>${esc(v.reason||'')}</td>
+      <td>${esc(v.created_by)}<br><span class="muted">${esc(v.created_at)}</span></td>
+      <td>${esc(v.submitted_by||'')}<br><span class="muted">${esc(v.submitted_at||'')}</span>${v.late?' <b>逾期</b>':''}</td>
+      <td><details><summary>稿件</summary><pre>${esc(JSON.stringify(v.content,null,2))}</pre></details>
+          ${v.receipt?`<details><summary>回执</summary><pre>${esc(JSON.stringify(v.receipt,null,2))}</pre></details>`:''}${prev}
+          <div class="muted">期限 ${esc(v.due_at)}${v.due_changed_at?`（${esc(v.due_changed_at)} 重算）`:''}</div></td></tr>`}).join('');
+  let actions='';
+  if(r.version_state==='pending')actions=`<div class="rowline"><textarea id="rcpt-${r.id}" placeholder='监管回执 JSON，如 {"ack":"ACK-3"}（可空）'></textarea>
+    <button onclick="submitReport(${r.id},false)">提交初稿</button></div>`;
+  if(r.version_state==='submitted')actions=`<div class="rowline">
+    <input id="reason-${r.id}" placeholder="更正原因（必填：监管退回/补录死亡…）" style="width:62%">
+    <textarea id="content-${r.id}" placeholder='更正后稿件 JSON，如 {"narrative":"死亡转归已补录"}'></textarea>
+    <button onclick="correctReport(${r.id})">发起更正</button></div>`;
+  if(r.version_state==='correction_pending')actions=`<div class="rowline">
+    <input id="subreason-${r.id}" placeholder="重提原因（该国已有未提交更正，必填）" style="width:62%">
+    <textarea id="rcpt-${r.id}" placeholder='新监管回执 JSON（可空）'></textarea>
+    <button onclick="submitReport(${r.id},true)">提交更正（重提）</button>
+    <hr class="muted"><input id="reason2-${r.id}" placeholder="重新发起更正的原因（必填）" style="width:40%">
+    <input id="replace-${r.id}" placeholder="作废未提交稿的原因（必填）" style="width:34%">
+    <textarea id="content2-${r.id}" placeholder='更正稿件 JSON'></textarea>
+    <button class="ghost" onclick="correctReport(${r.id},true)">作废并重开更正</button></div>`;
+  return `<section><b>${esc(r.country)}</b> ${badge}
+    <span class="muted">当前有效 v${r.effective_version??'-'} ｜ 未提交 v${r.pending_version??'-'} ｜ 期限 ${esc(r.due_at)}${r.due_changed_at?`（${esc(r.due_changed_at)} 重算）`:''}${r.late?' ｜ <b style="color:#b3261e">已逾期</b>':''}</span>
+    <table><tr><th>版本</th><th>状态</th><th>更正原因</th><th>起草人</th><th>提交人/时间</th><th>内容·回执·旧稿存档</th></tr>${rows}</table>${actions}</section>`}
+let currentCaseId=null;
+async function loadCase(id){
+  banner('');if(!id)return;currentCaseId=id;$('caseId').value=id;try{
+    const d=await api('GET',`/api/cases/${id}`);$('detailSec').hidden=false;$('raw').textContent=JSON.stringify(d,null,2);
+    $('caseTitle').textContent=`#${d.case.id} ${d.case.case_no}`;
+    $('caseMeta').innerHTML=`区域 ${esc(d.case.region)} ｜ ${esc(d.case.product)} ｜ ${esc(d.case.event_term)} ｜ 严重:${d.case.serious} 死亡:${d.case.fatal} ｜ 案例版本 rev${d.case.revision}`;
+    $('reports').innerHTML=d.reports.map(reportCard).join('')||'<span class="muted">尚无分国家报告</span>';
+  }catch(e){banner(`${e.code||''} ${e.message}`,true)}}
+function jsonVal(id,required){const raw=$(id).value.trim();if(!raw){if(required)throw new Error('请填写 JSON');return undefined}try{return JSON.parse(raw)}catch{throw new Error('JSON 格式错误')}}
+async function correctReport(id,replacing){
+  try{
+    const body={reason:$(replacing?`reason2-${id}`:`reason-${id}`).value.trim(),content:jsonVal(replacing?`content2-${id}`:`content-${id}`)};
+    if(replacing)body.replace_reason=$(`replace-${id}`).value.trim();
+    if(!body.reason)throw new Error('必须填写更正原因');
+    if(replacing&&!body.replace_reason)throw new Error('必须填写作废未提交稿的原因');
+    await api('POST',`/api/reports/${id}/corrections`,body);banner('更正稿已建立（尚未提交），当前有效版本不变');loadCase(currentCaseId);
+  }catch(e){banner(`${e.code||''} ${e.message}`,true)}}
+async function submitReport(id,isCorrection){
+  try{
+    const body={};const receipt=jsonVal(`rcpt-${id}`,false);if(receipt!==undefined)body.receipt=receipt;
+    if(isCorrection){body.reason=$(`subreason-${id}`).value.trim();if(!body.reason)throw new Error('该国已有未提交更正，必须说明重提原因')}
+    await api('POST',`/api/reports/${id}/submit`,body);banner(isCorrection?'更正已重提，新版本生效，旧稿与回执已存档':'初稿已提交');loadCase(currentCaseId);
+  }catch(e){banner(`${e.code||''} ${e.message}`,true)}}
+loadCases();
+</script>
