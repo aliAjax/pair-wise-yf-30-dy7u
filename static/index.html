@@ -1,5 +1,164 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>药物警戒案例台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;padding:0 20px;background:#f5f7fa;color:#172033}section{background:white;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}input,textarea,button{font:inherit;padding:8px;margin:4px}input,textarea{width:70%}button{background:#174ea6;color:white;border:0;border-radius:6px}pre{background:#111827;color:#d1fae5;padding:14px;overflow:auto}</style>
-<h1>药物警戒案例台</h1><p>标准库 JSON API 概览。请求需带 X-User-Id、X-Role；区域角色还需 X-Region。</p>
-<section><h2>快速查看</h2><input id="user" value="global-admin"><input id="role" value="global_admin"><button onclick="load()">刷新案例</button><pre id="out"></pre></section>
-<script>async function load(){let h={'X-User-Id':user.value,'X-Role':role.value};let r=await fetch('/api/state',{headers:h});out.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>药物警戒案例台</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;padding:0 20px;background:#f5f7fa;color:#172033}
+section{background:#fff;padding:20px;margin:16px 0;border-radius:12px;box-shadow:0 2px 12px #0001}
+input,select,button{font:inherit;padding:8px;margin:4px}
+button{background:#174ea6;color:#fff;border:0;border-radius:6px;cursor:pointer}
+button.ghost{background:#e8eefb;color:#174ea6}
+table{border-collapse:collapse;width:100%;margin:8px 0}
+th,td{border-bottom:1px solid #e5e9f0;padding:6px 8px;text-align:left;font-size:14px;vertical-align:top}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;background:#e8eefb;color:#174ea6;margin:1px}
+.badge.current{background:#0b7a3b;color:#fff}
+.badge.pending{background:#b26a00;color:#fff}
+.badge.dead{background:#b3261e;color:#fff}
+.muted{color:#5b6472;font-size:13px}
+.err{color:#b3261e}
+#msg{white-space:pre-wrap}
+.case-row{cursor:pointer;padding:8px;border-bottom:1px solid #e5e9f0}
+.case-row:hover{background:#f0f4fc}
+.report-card{border:1px solid #dfe5ef;border-radius:10px;padding:12px;margin:10px 0}
+h1{font-size:24px}h2{font-size:18px}h3{font-size:15px;margin:10px 0 4px}
+</style>
+<h1>药物警戒案例台</h1>
+<p class="muted">报告更正与重提：每次更正保留原因、旧稿、回执与提交人；严重性或死亡转归变化后按变更时间重算该国期限。</p>
+
+<section>
+<h2>身份</h2>
+<input id="user" value="lead-cn" placeholder="X-User-Id">
+<select id="role">
+<option value="regional_lead">regional_lead</option>
+<option value="reporter">reporter</option>
+<option value="medical_reviewer">medical_reviewer</option>
+<option value="global_admin">global_admin</option>
+</select>
+<input id="region" value="CN" placeholder="X-Region（区域角色必填）">
+<button onclick="loadCases()">刷新案例</button>
+<div id="msg" class="muted"></div>
+</section>
+
+<section><h2>案例列表</h2><div id="cases">加载中…</div></section>
+<section id="detailSec" style="display:none"><h2 id="detailTitle">案例详情</h2><div id="detail"></div></section>
+
+<script>
+const $=id=>document.getElementById(id);
+let openCase=null;
+const KIND={original:'首版',correction:'更正'};
+const VSTATUS={pending:'待提交',submitted:'当前有效',archived:'已存档',superseded:'已作废'};
+const RSTATUS={pending:'待提交',submitted:'已提交',correction_pending:'更正在途',overdue:'已逾期'};
+
+function hdrs(){const h={'X-User-Id':$('user').value,'X-Role':$('role').value};const r=$('region').value;if(r)h['X-Region']=r;return h}
+function note(t,err){$('msg').textContent=t;$('msg').className=err?'err':'muted'}
+async function api(method,url,body){
+  const opt={method,headers:hdrs()};
+  if(body!==undefined){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body)}
+  const r=await fetch(url,opt);
+  const data=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error((data.error||r.status)+'：'+(data.message||'请求失败'));
+  return data;
+}
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function loadCases(){
+  try{
+    const data=await api('GET','/api/state');
+    const box=$('cases');
+    if(!data.cases.length){box.innerHTML='<p class="muted">暂无案例</p>'}
+    else box.innerHTML=data.cases.map(c=>`
+      <div class="case-row" onclick="showCase(${c.id})">
+        <b>${esc(c.case_no)}</b> ${esc(c.product)} · ${esc(c.event_term)}
+        ${c.serious?'<span class="badge pending">严重</span>':''}${c.fatal?'<span class="badge dead">死亡</span>':''}
+        <span class="muted">区域 ${esc(c.region)} · 案例期限 ${esc(c.report_due_at)} · r${c.revision}</span>
+      </div>`).join('');
+    note(`服务器时间 ${data.server_time}；逾期/在途报告 ${data.overdue.length} 份`);
+    if(openCase)showCase(openCase);
+  }catch(e){note(e.message,true)}
+}
+
+function versionRows(versions){
+  return versions.map(v=>`<tr>
+    <td>V${v.version_no}${v.is_current?' <span class="badge current">当前有效</span>':''}</td>
+    <td>${KIND[v.kind]||v.kind}</td>
+    <td>${VSTATUS[v.status]||v.status}${v.supersede_reason?`<div class="muted">作废原因：${esc(v.supersede_reason)}</div>`:''}</td>
+    <td>${esc(v.reason||'—')}</td>
+    <td>${esc(v.receipt||'—')}</td>
+    <td>${esc(v.submitted_by||'—')}</td>
+    <td>${esc(v.submitted_at||'—')}</td>
+    <td>${esc(v.due_at)}</td>
+  </tr>`).join('');
+}
+
+async function showCase(id){
+  openCase=id;
+  try{
+    const d=await api('GET','/api/cases/'+id);
+    const c=d.case;
+    $('detailSec').style.display='block';
+    $('detailTitle').textContent=`案例 ${c.case_no}`;
+    let html=`<p class="muted">${esc(c.product)} · ${esc(c.event_term)} · 区域 ${esc(c.region)} · 状态 ${esc(c.status)} · 案例期限 ${esc(c.report_due_at)}</p>`;
+    html+='<h3>分国家报告</h3>';
+    if(!d.reports.length)html+='<p class="muted">尚无报告</p>';
+    for(const r of d.reports){
+      const current=(r.versions||[]).find(v=>v.is_current);
+      const pending=(r.versions||[]).find(v=>v.status==='pending');
+      html+=`<div class="report-card">
+        <b>${esc(r.country)}</b>
+        <span class="badge ${r.status==='submitted'?'current':(r.status==='overdue'?'dead':'pending')}">${RSTATUS[r.status]||r.status}</span>
+        ${current?`<span class="badge current">当前有效 V${current.version_no}</span>`:''}
+        ${pending?`<span class="badge pending">待提交 V${pending.version_no}</span>`:''}
+        <div>该国期限：<b>${esc(r.due_at)}</b>${r.late?' <span class="err">（上次提交逾期）</span>':''}</div>
+        <table><tr><th>版本</th><th>类型</th><th>状态</th><th>更正原因</th><th>回执</th><th>提交人</th><th>提交时间</th><th>期限</th></tr>
+        ${versionRows(r.versions||[])}</table>
+        <button onclick="correct(${r.id},${pending?1:0})">发起更正</button>
+        <button class="ghost" onclick="submitReport(${r.id},${pending&&pending.kind==='correction'?1:0})">提交${pending?' V'+pending.version_no:''}</button>
+      </div>`;
+    }
+    html+=`<h3>生成新报告</h3><input id="country" value="CN" placeholder="国家代码"><button onclick="createReport(${c.id})">生成报告</button>`;
+    html+=`<h3>医学裁定（medical_reviewer）</h3>
+      <label><input type="checkbox" id="mrSerious" ${c.serious?'checked':''}> 严重</label>
+      <label><input type="checkbox" id="mrFatal" ${c.fatal?'checked':''}> 死亡转归</label>
+      <input id="mrCausality" value="${esc(c.causality||'related')}" placeholder="关联性">
+      <input id="mrRationale" placeholder="裁定理由">
+      <button onclick="medReview(${c.id},${c.revision})">提交裁定</button>
+      <div class="muted">严重性或死亡转归变化后，将按裁定时间重算各国期限。</div>`;
+    $('detail').innerHTML=html;
+  }catch(e){note(e.message,true)}
+}
+
+async function createReport(caseId){
+  try{await api('POST',`/api/cases/${caseId}/reports`,{country:$('country').value});note('报告已生成');showCase(caseId)}
+  catch(e){note(e.message,true)}
+}
+async function correct(reportId,hasPending){
+  const reason=prompt('更正原因（必填）：');if(!reason)return;
+  const body={reason};
+  if(hasPending){
+    const sr=prompt('该国已有未提交更正，再次发起须说明原因（supersede_reason，必填）：');
+    if(!sr)return;
+    body.supersede_reason=sr;
+  }
+  try{const r=await api('POST',`/api/reports/${reportId}/corrections`,body);note(`已创建更正版本 V${r.version.version_no}`);showCase(openCase)}
+  catch(e){note(e.message,true)}
+}
+async function submitReport(reportId,isCorrection){
+  const body={};
+  const receipt=prompt('监管回执编号（留空由系统生成）：');if(receipt)body.receipt=receipt;
+  if(isCorrection){
+    const reason=prompt('提交更正版本须说明原因（必填）：');if(!reason)return;
+    body.reason=reason;
+  }
+  try{const r=await api('POST',`/api/reports/${reportId}/submit`,body);note(`已提交，回执 ${r.version?r.version.receipt:'（幂等）'}`);showCase(openCase)}
+  catch(e){note(e.message,true)}
+}
+async function medReview(caseId,revision){
+  const rationale=$('mrRationale').value.trim();
+  if(!rationale){note('裁定理由必填',true);return}
+  const body={expected_revision:revision,serious:$('mrSerious').checked,fatal:$('mrFatal').checked,
+    causality:$('mrCausality').value.trim()||'related',rationale,received_at:new Date().toISOString()};
+  try{await api('POST',`/api/cases/${caseId}/medical-review`,body);note('裁定已记录，期限已重算');showCase(caseId)}
+  catch(e){note(e.message,true)}
+}
+loadCases();
+</script>

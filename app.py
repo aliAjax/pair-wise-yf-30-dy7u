@@ -7,11 +7,14 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import version_rules
+from report_archive import ReportArchive
 
 PORT = 8201
 ROLES = {"reporter", "regional_lead", "medical_reviewer", "global_admin"}
@@ -23,6 +26,14 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+def _rule(check: Any, *args: Any) -> None:
+    """执行版本规则校验，把 RuleViolation 转换为 API 错误。"""
+    try:
+        check(*args)
+    except version_rules.RuleViolation as exc:
+        raise ApiError(exc.status, exc.code, exc.message) from None
 
 
 def utcnow() -> datetime:
@@ -46,12 +57,6 @@ def parse_time(value: str | None, default: datetime | None = None) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
-
-
-def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> datetime:
-    if serious:
-        return received_at + timedelta(days=7 if fatal else 15)
-    return received_at + timedelta(days=90)
 
 
 class Repository:
@@ -151,6 +156,7 @@ class Repository:
             );
             """
         )
+        ReportArchive.init_schema(self.conn)
 
     @staticmethod
     def audit(conn: sqlite3.Connection, case_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -189,6 +195,12 @@ class PharmacovigilanceService:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
 
+    def _report(self, conn: sqlite3.Connection, report_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not row:
+            raise ApiError(404, "report_not_found", "报告不存在")
+        return row
+
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
         missing = [key for key in required if not str(body.get(key, "")).strip()]
@@ -201,7 +213,7 @@ class PharmacovigilanceService:
         received = parse_time(body.get("received_at"), utcnow())
         serious = bool(body.get("serious", False))
         fatal = bool(body.get("fatal", False))
-        due = report_deadline(received, serious, fatal)
+        due = version_rules.report_deadline(received, serious, fatal)
         now = iso()
         with self.repo.tx() as conn:
             duplicate = conn.execute("SELECT * FROM intakes WHERE dedupe_key=?", (body["dedupe_key"],)).fetchone()
@@ -236,11 +248,14 @@ class PharmacovigilanceService:
         if not self.can_access(case, role, region):
             raise ApiError(403, "case_forbidden", "无权查看该区域案例")
         conn = self.repo.conn
+        reports = [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))]
+        for report in reports:
+            report["versions"] = ReportArchive.versions(conn, report["id"])
         return {
             "case": dict(case),
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
-            "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
+            "reports": reports,
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
         }
@@ -275,7 +290,7 @@ class PharmacovigilanceService:
                 raise ApiError(409, "revision_conflict", "案例已被其他人员更新，请重新读取")
             revision = case["revision"] + 1
             received = parse_time(body.get("received_at"), utcnow())
-            due = report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
+            due = version_rules.report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
             conn.execute(
                 "INSERT INTO followups(case_id,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (case_id, content, source, iso(received), revision, actor, iso()),
@@ -302,7 +317,7 @@ class PharmacovigilanceService:
         if fatal and not serious:
             raise ApiError(400, "invalid_severity", "死亡案例必须标记为严重")
         received = parse_time(body.get("received_at"))
-        due = report_deadline(received, serious, fatal)
+        due = version_rules.report_deadline(received, serious, fatal)
         with self.repo.tx() as conn:
             case = self._case(conn, case_id)
             if case["status"] == "merged":
@@ -310,6 +325,7 @@ class PharmacovigilanceService:
             if case["revision"] != expected:
                 raise ApiError(409, "revision_conflict", "案例版本已变化")
             revision = expected + 1
+            severity_changed = bool(case["serious"]) != serious or bool(case["fatal"]) != fatal
             conn.execute(
                 """UPDATE cases SET serious=?,fatal=?,causality=?,report_due_at=?,revision=?,updated_at=? WHERE id=?""",
                 (int(serious), int(fatal), causality, iso(due), revision, iso(), case_id),
@@ -319,8 +335,22 @@ class PharmacovigilanceService:
                    VALUES(?,?,?,?,?,?,?,?)""",
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
+            if severity_changed:
+                self._recalculate_report_deadlines(conn, case_id, received, due, actor, role)
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
             return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
+
+    @staticmethod
+    def _recalculate_report_deadlines(conn: sqlite3.Connection, case_id: int, changed_at: datetime,
+                                      due: datetime, actor: str, role: str) -> None:
+        """严重性或死亡转归变化后，按变更时间重算各国报告与在途版本的期限。"""
+        for report in conn.execute("SELECT * FROM reports WHERE case_id=?", (case_id,)).fetchall():
+            old_due = report["due_at"]
+            conn.execute("UPDATE reports SET due_at=? WHERE id=?", (iso(due), report["id"]))
+            ReportArchive.recalc_pending_deadline(conn, report["id"], iso(due))
+            Repository.audit(conn, case_id, actor, role, "report_deadline_recalculated",
+                             {"report_id": report["id"], "country": report["country"],
+                              "old_due_at": old_due, "new_due_at": iso(due), "changed_at": iso(changed_at)})
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
@@ -332,30 +362,97 @@ class PharmacovigilanceService:
             case = self._case(conn, case_id)
             if not self.can_access(case, role, region):
                 raise ApiError(403, "region_forbidden", "不能为本区域之外案例生成报告")
-            due = report_deadline(parse_time(case["received_at"]), bool(case["serious"]), bool(case["fatal"]))
+            due = case["report_due_at"]
             try:
-                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)", (case_id, country, iso(due), "pending"))
+                cur = conn.execute("INSERT INTO reports(case_id,country,due_at,status) VALUES(?,?,?,?)",
+                                   (case_id, country, due, version_rules.REPORT_PENDING))
             except sqlite3.IntegrityError as exc:
                 raise ApiError(409, "report_exists", "该国家报告已经存在") from exc
-            Repository.audit(conn, case_id, actor, role, "report_created", {"report_id": cur.lastrowid, "country": country})
-            return dict(conn.execute("SELECT * FROM reports WHERE id=?", (cur.lastrowid,)).fetchone())
+            report_id = cur.lastrowid
+            payload = version_rules.snapshot_payload(dict(case), {"country": country}, 1,
+                                                     version_rules.KIND_ORIGINAL, None, due)
+            ReportArchive.create(conn, report_id, version_rules.KIND_ORIGINAL, None, payload,
+                                 bool(case["serious"]), bool(case["fatal"]), due, actor, iso())
+            Repository.audit(conn, case_id, actor, role, "report_created",
+                             {"report_id": report_id, "country": country, "version_no": 1})
+            return dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone())
+
+    def create_correction(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
+        """对已提交报告发起更正：保留更正原因与旧稿快照，生成在途新版本。"""
+        if role not in {"regional_lead", "global_admin"}:
+            raise ApiError(403, "correction_forbidden", "只有区域负责人或全局管理员可以发起更正")
+        reason = str(body.get("reason", "")).strip()
+        _rule(version_rules.ensure_correction_reason, reason)
+        with self.repo.tx() as conn:
+            report = self._report(conn, report_id)
+            case = self._case(conn, report["case_id"])
+            if not self.can_access(dict(case), role, region):
+                raise ApiError(403, "region_forbidden", "其他区域不能操作该报告")
+            if case["status"] == "merged":
+                raise ApiError(409, "case_merged", "已合并案例不能更正报告")
+            _rule(version_rules.ensure_may_correct, ReportArchive.latest_submitted(conn, report_id) is not None)
+            pending = ReportArchive.pending(conn, report_id)
+            supersede_reason = str(body.get("supersede_reason", "")).strip()
+            _rule(version_rules.ensure_supersede_reason, pending is not None, supersede_reason)
+            if pending:
+                ReportArchive.supersede(conn, pending["id"], supersede_reason)
+                Repository.audit(conn, case["id"], actor, role, "correction_superseded",
+                                 {"report_id": report_id, "country": report["country"],
+                                  "version_no": pending["version_no"], "supersede_reason": supersede_reason})
+            due = report["due_at"]
+            version_no = ReportArchive.next_version_no(conn, report_id)
+            payload = version_rules.snapshot_payload(dict(case), dict(report), version_no,
+                                                     version_rules.KIND_CORRECTION, reason, due)
+            version = ReportArchive.create(conn, report_id, version_rules.KIND_CORRECTION, reason, payload,
+                                           bool(case["serious"]), bool(case["fatal"]), due, actor, iso())
+            conn.execute("UPDATE reports SET status=? WHERE id=?", (version_rules.REPORT_CORRECTION_PENDING, report_id))
+            Repository.audit(conn, case["id"], actor, role, "correction_created",
+                             {"report_id": report_id, "country": report["country"],
+                              "version_no": version["version_no"], "reason": reason})
+            return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()),
+                    "version": version}
 
     def submit_report(self, report_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
             raise ApiError(403, "submit_forbidden", "当前角色不能提交监管报告")
         with self.repo.tx() as conn:
-            row = conn.execute("SELECT r.*,c.region FROM reports r JOIN cases c ON c.id=r.case_id WHERE r.id=?", (report_id,)).fetchone()
-            if not row:
-                raise ApiError(404, "report_not_found", "报告不存在")
-            if not self.can_access(dict(row), role, region):
+            report = self._report(conn, report_id)
+            case = self._case(conn, report["case_id"])
+            if not self.can_access(dict(case), role, region):
                 raise ApiError(403, "region_forbidden", "无权提交其他区域报告")
-            if row["status"] == "submitted":
-                return {"report": dict(row), "idempotent": True}
+            pending = ReportArchive.pending(conn, report_id)
+            if pending is None:
+                if report["status"] == version_rules.REPORT_SUBMITTED:
+                    return {"report": dict(report), "idempotent": True}
+                # 兼容无版本历史的旧报告：补建首版后再提交
+                payload = version_rules.snapshot_payload(dict(case), dict(report), 1,
+                                                         version_rules.KIND_ORIGINAL, None, report["due_at"])
+                pending = ReportArchive.create(conn, report_id, version_rules.KIND_ORIGINAL, None, payload,
+                                               bool(case["serious"]), bool(case["fatal"]), report["due_at"], actor, iso())
+            reason = str(body.get("reason", "")).strip()
+            _rule(version_rules.ensure_submission_reason, pending["kind"], reason)
             now = parse_time(body.get("submitted_at"), utcnow())
-            late = int(now > parse_time(row["due_at"]))
-            conn.execute("UPDATE reports SET status='submitted',submitted_at=?,submitted_by=?,late=? WHERE id=?", (iso(now), actor, late, report_id))
-            Repository.audit(conn, row["case_id"], actor, role, "report_submitted", {"report_id": report_id, "country": row["country"], "late": bool(late)})
-            return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()), "idempotent": False}
+            receipt = str(body.get("receipt", "")).strip() or version_rules.make_receipt(report_id, pending["version_no"], now)
+            late = int(now > parse_time(pending["due_at"]))
+            ReportArchive.archive_submitted(conn, report_id, pending["id"])
+            ReportArchive.mark_submitted(conn, pending["id"], iso(now), actor, receipt)
+            conn.execute("UPDATE reports SET status=?,due_at=?,submitted_at=?,submitted_by=?,late=? WHERE id=?",
+                         (version_rules.REPORT_SUBMITTED, pending["due_at"], iso(now), actor, late, report_id))
+            Repository.audit(conn, case["id"], actor, role, "report_submitted",
+                             {"report_id": report_id, "country": report["country"], "version_no": pending["version_no"],
+                              "kind": pending["kind"], "receipt": receipt, "late": bool(late),
+                              "reason": reason or None})
+            return {"report": dict(conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()),
+                    "version": dict(conn.execute("SELECT * FROM report_versions WHERE id=?", (pending["id"],)).fetchone()),
+                    "idempotent": False}
+
+    def list_versions(self, report_id: int, role: str, region: str) -> list[dict[str, Any]]:
+        conn = self.repo.conn
+        report = self._report(conn, report_id)
+        case = self._case(conn, report["case_id"])
+        if not self.can_access(dict(case), role, region):
+            raise ApiError(403, "region_forbidden", "无权查看其他区域报告版本")
+        return ReportArchive.versions(conn, report_id)
 
     def merge_cases(self, source_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "global_admin":
@@ -390,7 +487,9 @@ class PharmacovigilanceService:
         rows = self.overdue(role, region)
         with self.repo.tx() as conn:
             for row in rows:
-                conn.execute("UPDATE reports SET status='overdue' WHERE id=? AND status='pending'", (row["id"],))
+                conn.execute("UPDATE reports SET status=? WHERE id=? AND status IN (?,?)",
+                             (version_rules.REPORT_OVERDUE, row["id"],
+                              version_rules.REPORT_PENDING, version_rules.REPORT_CORRECTION_PENDING))
                 Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
         return {"escalated": len(rows)}
 
@@ -440,6 +539,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "versions":
+            return 200, {"versions": self.service.list_versions(int(parts[2]), role, region)}
         raise ApiError(404, "not_found", "接口不存在")
 
     def _dispatch_post(self, path: str, body: dict[str, Any]) -> Any:
@@ -459,8 +560,11 @@ class Handler(BaseHTTPRequestHandler):
                 return 201, self.service.create_report(case_id, actor, role, region, body)
             if action == "merge":
                 return 200, self.service.merge_cases(case_id, actor, role, body)
-        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit() and parts[3] == "submit":
-            return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+        if len(parts) == 4 and parts[:2] == ["api", "reports"] and parts[2].isdigit():
+            if parts[3] == "submit":
+                return 200, self.service.submit_report(int(parts[2]), actor, role, region, body)
+            if parts[3] == "corrections":
+                return 201, self.service.create_correction(int(parts[2]), actor, role, region, body)
         raise ApiError(404, "not_found", "接口不存在")
 
     def _handle(self, method: str) -> None:
